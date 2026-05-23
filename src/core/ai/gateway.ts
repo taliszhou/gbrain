@@ -621,7 +621,7 @@ export function isAvailable(touchpoint: TouchpointKind, modelOverride?: string):
         ? getRerankerModel() ?? null
         : null;
     if (!modelStr) return false;
-    const { recipe } = resolveRecipe(modelStr);
+    const { recipe, parsed } = resolveRecipe(modelStr);
 
     // Recipe must actually support the requested touchpoint.
     // Anthropic declares only expansion + chat (no embedding model); requesting
@@ -639,7 +639,13 @@ export function isAvailable(touchpoint: TouchpointKind, modelOverride?: string):
     if (
       Array.isArray(touchpointConfig.models) &&
       touchpointConfig.models.length === 0 &&
-      (recipe.id === 'litellm' || isUserProvided)
+      (recipe.id === 'litellm' || isUserProvided) &&
+      // Empty static model list means the model must come from the user's
+      // config. If a concrete `provider:model` was resolved (parsed.modelId
+      // non-empty), the user DID provide it — fall through to the auth check.
+      // Only unavailable when the configured value is bare `provider` with no
+      // model id.
+      !parsed.modelId
     ) return false;
 
     // For openai-compatible without auth requirements (Ollama local), treat as always-available.

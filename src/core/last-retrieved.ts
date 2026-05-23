@@ -77,6 +77,12 @@ export function _resetTrackRetrievalCacheForTests(): void {
  */
 export function bumpLastRetrievedAt(engine: BrainEngine, pageIds: number[]): void {
   if (pageIds.length === 0) return;
+  // PGLite has a single WASM connection that cannot run a concurrent
+  // fire-and-forget query alongside the in-flight response/teardown path —
+  // doing so spins the runtime at ~100% CPU and the one-shot CLI never exits.
+  // The LSD `last_retrieved_at` signal is best-effort and droppable, so skip
+  // it on PGLite. Postgres (pooled connections) handles the concurrency fine.
+  if (engine.kind === 'pglite') return;
   // Fire-and-forget on purpose. We deliberately do NOT return the promise.
   void (async () => {
     try {

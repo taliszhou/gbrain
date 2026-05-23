@@ -282,7 +282,7 @@ export function resolveSchemaEmbeddingDim(opts: ResolveSchemaEmbeddingDimOpts): 
           `Pick a recipe with an embedding touchpoint (gbrain providers list).`,
       };
     }
-    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_dimensions);
+    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_dimensions, tp.user_provided_models ?? false);
   } catch (err) {
     return { ok: false, error: err instanceof AIConfigError ? err.message : String(err) };
   }
@@ -333,7 +333,7 @@ export function resolveSchemaMultimodalDim(opts: ResolveSchemaMultimodalDimOpts)
           `Pick a multimodal-capable model from this provider.`,
       };
     }
-    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_multimodal_dimensions);
+    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_multimodal_dimensions, tp.user_provided_models ?? false);
   } catch (err) {
     return { ok: false, error: err instanceof AIConfigError ? err.message : String(err) };
   }
@@ -363,6 +363,7 @@ function validateDimAgainstTouchpoint(
   defaultDims: number,
   dimsOptions: number[] | undefined,
   requestedDims: number | undefined,
+  userProvidedModels = false,
 ): ResolveSchemaDimResult {
   const dim = requestedDims ?? defaultDims;
 
@@ -381,8 +382,12 @@ function validateDimAgainstTouchpoint(
     };
   }
 
-  if (requestedDims !== undefined && requestedDims !== defaultDims) {
+  if (requestedDims !== undefined && requestedDims !== defaultDims && !userProvidedModels) {
     // User asked for a non-default dim. Walk the precedence chain.
+    // Skipped for user_provided_models recipes (llama-server, litellm): the
+    // user launched the server and knows its native vector size — there's no
+    // "custom vs native" distinction to enforce, and these recipes declare
+    // default_dims: 0 specifically to force an explicit --embedding-dimensions.
     const customDimOk = isCustomDimValidForProvider(recipe, modelId, requestedDims, dimsOptions);
     if (!customDimOk.valid) {
       return { ok: false, error: customDimOk.error };
