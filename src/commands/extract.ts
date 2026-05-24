@@ -792,8 +792,13 @@ async function extractLinksFromDB(
   // once, not once per mention.
   const resolver = makeResolver(engine, { mode: 'batch' });
   const unresolved: UnresolvedFrontmatterRef[] = [];
+  // Bare Obsidian wikilinks (`[[dflash]]`) are markdown BODY out-links — like
+  // prefixed `[[concepts/x]]` they must extract regardless of the
+  // frontmatter-resolution toggle. So even the null (frontmatter-off) resolver
+  // carries resolveBareName; only frontmatter NAME resolution is nulled out.
   const nullResolver = {
     resolve: async () => null as string | null,
+    resolveBareName: resolver.resolveBareName?.bind(resolver),
   };
   // v0.32.8: listAllPageRefs enumerates (slug, source_id) so we can thread
   // sourceId to getPage AND build a cross-source resolution map for link

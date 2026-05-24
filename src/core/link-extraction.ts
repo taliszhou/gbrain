@@ -402,6 +402,32 @@ export async function extractPageLinks(
     });
   }
 
+  // 2c. Bare Obsidian wikilinks: [[dflash]] — no directory prefix, no
+  //     `source:` qualifier. Obsidian resolves these by filename; gbrain
+  //     resolves them by page basename (resolveBareName) so a vault that uses
+  //     native bare wikilinks gets a real graph instead of an empty one. The
+  //     markdown files are NEVER modified — this only changes how gbrain READS
+  //     them, so Obsidian keeps working identically. Prefixed `[[dir/slug]]`
+  //     and qualified `[[src:dir/slug]]` are handled by extractEntityRefs above
+  //     (the `[^/:...]` class here excludes both, so no double-counting).
+  if (resolver.resolveBareName) {
+    const bareWikiRe = /\[\[([^/:|\]#[]+?)(?:#[^|\]]*?)?(?:\|([^\]]+?))?\]\]/g;
+    let bw: RegExpExecArray | null;
+    while ((bw = bareWikiRe.exec(strippedContent)) !== null) {
+      const rawName = bw[1].trim();
+      if (!rawName || rawName.includes('://')) continue;
+      const resolved = await resolver.resolveBareName(rawName);
+      if (!resolved || resolved === slug) continue; // skip unresolved + self-links
+      const context = excerpt(strippedContent, bw.index, 240);
+      candidates.push({
+        targetSlug: resolved,
+        linkType: inferLinkType(pageType, context, content, resolved),
+        context,
+        linkSource: 'markdown',
+      });
+    }
+  }
+
   // 3. Frontmatter-derived edges (v0.13). Includes the legacy `source:`
   // field along with the full field map.
   const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver);
@@ -640,6 +666,17 @@ export interface SlugResolver {
    * extract/put_page summary so the user can see the gap.
    */
   resolve(name: string, dirHint?: string | string[]): Promise<string | null>;
+
+  /**
+   * Resolve a BARE Obsidian wikilink `[[name]]` (no directory prefix) to a
+   * canonical slug by matching the page basename — Obsidian's native
+   * filename-resolution semantics. `[[dflash]]` → `entities/dflash` when a
+   * page slug ends in `/dflash`. Exact basename match only (slugified); no
+   * fuzzy fallback, so a bare link never silently points at the wrong page.
+   * Returns null when no page has that basename. Optional so pre-existing
+   * resolvers (and pure callers) keep working unchanged.
+   */
+  resolveBareName?(name: string): Promise<string | null>;
 }
 
 /**
@@ -664,6 +701,35 @@ export function makeResolver(
   const cache = new Map<string, string | null>();
 
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+
+  // Lazily-built index of page basename (last slug segment) → full slug(s).
+  // Loaded once per resolver instance from the engine's slug snapshot. Used by
+  // resolveBareName so bare Obsidian wikilinks resolve to real pages.
+  let basenameIndex: Map<string, string[]> | null = null;
+  const buildBasenameIndex = async (): Promise<Map<string, string[]>> => {
+    if (basenameIndex) return basenameIndex;
+    const idx = new Map<string, string[]>();
+    const slugs = await engine.getAllSlugs();
+    for (const slug of slugs) {
+      const base = slug.slice(slug.lastIndexOf('/') + 1);
+      const arr = idx.get(base);
+      if (arr) arr.push(slug);
+      else idx.set(base, [slug]);
+    }
+    basenameIndex = idx;
+    return idx;
+  };
+  // On the rare cross-directory basename collision (Obsidian filenames are
+  // unique, so this is uncommon), prefer entity-ish dirs and otherwise pick
+  // deterministically so the same input always yields the same edge.
+  const BARE_DIR_PRIORITY = ['entities', 'people', 'companies', 'concepts', 'comparisons', 'projects', 'topics'];
+  const pickBareMatch = (matches: string[]): string => {
+    for (const dir of BARE_DIR_PRIORITY) {
+      const hit = matches.find(s => s.startsWith(`${dir}/`));
+      if (hit) return hit;
+    }
+    return [...matches].sort()[0];
+  };
 
   return {
     async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
@@ -731,6 +797,21 @@ export function makeResolver(
       // Null = unresolvable. Caller records for the unresolved report.
       cache.set(cacheKey, null);
       return null;
+    },
+
+    async resolveBareName(name: string): Promise<string | null> {
+      if (!name || typeof name !== 'string') return null;
+      const base = norm(name.trim());
+      if (!base) return null;
+      const ck = `bare ${base}`;
+      if (cache.has(ck)) return cache.get(ck)!;
+      const idx = await buildBasenameIndex();
+      const matches = idx.get(base);
+      const result = matches && matches.length > 0
+        ? (matches.length === 1 ? matches[0] : pickBareMatch(matches))
+        : null;
+      cache.set(ck, result);
+      return result;
     },
   };
 }
