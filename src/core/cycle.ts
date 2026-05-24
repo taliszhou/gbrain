@@ -1255,7 +1255,49 @@ export async function runCycle(
     }
   }
 
+  // PGLite has no separate worker daemon — its exclusive file lock blocks
+  // other processes (`gbrain jobs work` refuses PGLite). So the `subagent`
+  // jobs that the synthesize/patterns phases enqueue would never be drained;
+  // those phases would submit work and time out waiting for a worker that
+  // cannot exist. Start an in-process worker (concurrency 1 = serial, safe on
+  // PGLite's single connection) to drain them in THIS process — the same
+  // mechanism `gbrain jobs submit --follow` uses. Postgres deployments run a
+  // real multi-process worker daemon and skip this entirely.
+  let inlineWorker: any = null;
+  let inlineWorkerDone: Promise<void> | null = null;
   try {
+    if (engine && engine.kind === 'pglite' && (phases.includes('synthesize') || phases.includes('patterns'))) {
+      try {
+        const { MinionWorker } = await import('./minions/worker.ts');
+        const { registerBuiltinHandlers } = await import('../commands/jobs.ts');
+        const w = new MinionWorker(engine, {
+          queue: 'default',
+          concurrency: 1,
+          pollInterval: 200,
+          healthCheckInterval: 0, // one-shot inline flow; no process manager to restart it
+          // Generous lock duration. On PGLite the single connection serializes
+          // queries, so the 15s lock-renewal heartbeat (lockDuration/2) can be
+          // delayed behind a slow subagent turn (local reasoning models take
+          // 20-40s/turn). With the 30s default the lock expires mid-execution,
+          // the stall detector requeues the job, and the original run loses its
+          // lock and aborts. A single in-process worker has no lock contention,
+          // so a 10-minute lock is safe and lets slow local models finish; the
+          // per-job timeout_ms (30min, set by synthesize) still bounds runaway.
+          lockDuration: 10 * 60 * 1000,
+        });
+        await registerBuiltinHandlers(w, engine);
+        inlineWorker = w;
+        inlineWorkerDone = w.start();
+      } catch (e) {
+        // Non-fatal: without the inline worker, synthesize/patterns time out as
+        // before, but every other phase still runs. Surface to stderr so the
+        // operator knows why subagent phases didn't execute.
+        console.error(
+          `[cycle] PGLite inline subagent worker failed to start: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+
     // ── Phase 1: lint ────────────────────────────────────────────
     if (phases.includes('lint')) {
       checkAborted(opts.signal);
@@ -1707,6 +1749,15 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
   } finally {
+    // Stop the inline subagent worker (PGLite) BEFORE releasing the cycle
+    // lock — it shares this process's engine connection. start() resolves
+    // once stop() drains in-flight work.
+    if (inlineWorker) {
+      try {
+        inlineWorker.stop();
+        if (inlineWorkerDone) await inlineWorkerDone;
+      } catch { /* best-effort */ }
+    }
     if (lock) {
       try { await lock.release(); } catch { /* best-effort */ }
     }

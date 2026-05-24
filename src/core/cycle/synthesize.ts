@@ -296,7 +296,7 @@ export async function runPhaseSynthesize(
     // Significance verdicts (cached in dream_verdicts; Haiku on miss).
     const worthProcessing: DiscoveredTranscript[] = [];
     const verdicts: Array<{ filePath: string; worth: boolean; reasons: string[]; cached: boolean }> = [];
-    const haiku = makeHaikuClient(); // null if no API key
+    const haiku = await makeHaikuClient(config.verdictModel); // null only when no usable provider
     for (const t of transcripts) {
       const cached = await engine.getDreamVerdict(t.filePath, t.contentHash);
       if (cached) {
@@ -639,10 +639,37 @@ export interface JudgeClient {
   create: (params: Anthropic.MessageCreateParamsNonStreaming) => Promise<Anthropic.Message>;
 }
 
-function makeHaikuClient(): JudgeClient | null {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
-  const client = new Anthropic();
-  return { create: client.messages.create.bind(client.messages) };
+async function makeHaikuClient(verdictModel: string): Promise<JudgeClient | null> {
+  const { isAnthropicProvider } = await import('../model-config.ts');
+  // Anthropic path: key present AND the verdict model is an Anthropic model.
+  if (process.env.ANTHROPIC_API_KEY && isAnthropicProvider(verdictModel)) {
+    const client = new Anthropic();
+    return { create: client.messages.create.bind(client.messages) };
+  }
+  // Non-Anthropic verdict model (local Qwen, OpenAI-compatible, etc.) → route
+  // the significance judge through the gateway so it works without an
+  // Anthropic key. Returns an Anthropic.Message-shaped object so
+  // judgeSignificance's content[].text parsing stays unchanged.
+  if (!isAnthropicProvider(verdictModel)) {
+    return {
+      create: async (params: Anthropic.MessageCreateParamsNonStreaming) => {
+        const { chat } = await import('../ai/gateway.ts');
+        const messages = (params.messages ?? []).map((m) => ({
+          role: m.role as 'user' | 'assistant',
+          content: typeof m.content === 'string' ? m.content : String(m.content ?? ''),
+        }));
+        const res = await chat({
+          model: params.model,
+          system: typeof params.system === 'string' ? params.system : undefined,
+          messages,
+          maxTokens: params.max_tokens,
+        });
+        return { content: [{ type: 'text', text: res.text }] } as unknown as Anthropic.Message;
+      },
+    };
+  }
+  // Anthropic model requested but no key — skip gracefully (legacy behavior).
+  return null;
 }
 
 interface VerdictResult {
