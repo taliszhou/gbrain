@@ -738,18 +738,52 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
   // Convert prior Anthropic-shape messages → ChatMessage with ChatBlock content.
   // v1 rows store Anthropic content blocks ({type:'tool_use'|'tool_result'|...});
   // we adapt them to ChatBlock shape (type: 'tool-call' | 'tool-result' | 'text').
-  const priorChatMessages: ChatMessage[] = priorMessages.map(m => ({
-    role: m.role as 'user' | 'assistant',
-    content: adaptContentBlocksToChatBlocks(m.content_blocks),
-  }));
+  // Reconstruct the conversation for replay, INTERLEAVING tool-result messages
+  // after each assistant turn that made tool calls. The gateway path persists
+  // tool results in subagent_tool_executions (NOT as messages), so the raw
+  // message history is `...assistant(tool-calls), assistant(tool-calls)...`
+  // with no tool messages between them. A resumed run then sends tool-calls
+  // with no matching results and the provider rejects it ("Tool results are
+  // missing for tool calls ..."). Rebuilding the tool messages here from the
+  // persisted executions keeps the resumed conversation valid. The legacy
+  // Anthropic path does the equivalent via synthesizedResults; the v0.38
+  // gateway path omitted it. NOTE: nextMessageIdx / nextTurnIdx below stay
+  // based on the ORIGINAL persisted `priorMessages` (the synthesized tool
+  // messages are never persisted), so the replay bookkeeping is unchanged.
+  const priorToolsByUseId = new Map<string, PriorToolV2Row>();
+  for (const row of priorTools) priorToolsByUseId.set(row.toolUseId, row);
+
+  const priorChatMessages: ChatMessage[] = [];
+  for (const m of priorMessages) {
+    const content = adaptContentBlocksToChatBlocks(m.content_blocks);
+    priorChatMessages.push({ role: m.role as 'user' | 'assistant', content });
+    if (m.role !== 'assistant' || !Array.isArray(content)) continue;
+    const calls = content.filter((b): b is Extract<ChatBlock, { type: 'tool-call' }> => b.type === 'tool-call');
+    if (calls.length === 0) continue;
+    const resultBlocks: ChatBlock[] = calls.map(call => {
+      const row = priorToolsByUseId.get(call.toolCallId);
+      if (row && row.status === 'complete') {
+        return { type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: row.output };
+      }
+      if (row && row.status === 'failed') {
+        return { type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: row.error ?? 'tool failed', isError: true };
+      }
+      // No recorded outcome (pending / crashed mid-execute) — synthesize an
+      // error result so the conversation stays valid for the provider.
+      return { type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: 'tool result not recorded before resume', isError: true };
+    });
+    priorChatMessages.push({ role: 'tool', content: resultBlocks });
+  }
 
   // Initial seed message if no prior state.
-  const initialMessages: ChatMessage[] = priorChatMessages.length === 0
+  const initialMessages: ChatMessage[] = priorMessages.length === 0
     ? [{ role: 'user', content: data.prompt }]
     : [];
 
   // Persist seed user message at idx 0 if fresh start.
-  let nextMessageIdx = priorChatMessages.length;
+  // Based on PERSISTED messages, not the interleaved priorChatMessages (the
+  // synthesized tool messages are not persisted, so they must not shift idx).
+  let nextMessageIdx = priorMessages.length;
   if (nextMessageIdx === 0) {
     await persistMessage(engine, ctx.id, {
       message_idx: 0,
@@ -798,7 +832,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     replayState: {
       priorMessages: priorChatMessages,
       priorTools: priorToolsByStableKey,
-      nextTurnIdx: priorChatMessages.filter(m => m.role === 'assistant').length,
+      nextTurnIdx: priorMessages.filter(m => m.role === 'assistant').length,
       nextMessageIdx,
     },
     onAssistantTurn: async (turnIdx, messageIdx, blocks, usage, modelStr) => {
@@ -955,6 +989,10 @@ interface PriorToolV2Row {
   status: 'pending' | 'complete' | 'failed';
   output: unknown;
   error: string | null;
+  /** Provider tool-call id — matches the assistant turn's tool-call block id.
+   * Used to reconstruct interleaved tool-result messages on gateway-path replay. */
+  toolUseId: string;
+  toolName: string;
 }
 
 /**
@@ -990,6 +1028,8 @@ async function loadPriorToolsV2(engine: BrainEngine, jobId: number): Promise<Pri
       status: r.status as 'pending' | 'complete' | 'failed',
       output: r.output,
       error: (r.error as string | null) ?? null,
+      toolUseId: r.tool_use_id as string,
+      toolName: r.tool_name as string,
     };
   });
 }

@@ -63,9 +63,13 @@ export async function runPhasePatterns(
       });
     }
 
-    // Submit one subagent for pattern detection.
-    if (!process.env.ANTHROPIC_API_KEY) {
-      return skipped('no_api_key', 'ANTHROPIC_API_KEY unset; pattern detection skipped');
+    // Submit one subagent for pattern detection. The subagent runs through the
+    // gateway (provider-neutral when agent.use_gateway_loop is on), so skip only
+    // when NO chat provider is usable — not specifically when Anthropic is
+    // missing. A configured local model (Qwen, etc.) is enough.
+    const { isAvailable } = await import('../ai/gateway.ts');
+    if (!process.env.ANTHROPIC_API_KEY && !isAvailable('chat')) {
+      return skipped('no_api_key', 'no chat provider available (set ANTHROPIC_API_KEY or configure a chat model); pattern detection skipped');
     }
 
     const allowedSlugPrefixes = await loadAllowedSlugPrefixes();

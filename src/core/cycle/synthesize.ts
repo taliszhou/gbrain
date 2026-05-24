@@ -707,8 +707,15 @@ Respond as JSON: {"worth_processing": <bool>, "reasons": ["<short>", "<short>"]}
 Two reasons max, one phrase each.`;
 
   const msg = await client.create({
+    // 2048, not 200: reasoning models (qwen *-reasoning-*, deepseek-r1, o-series
+    // via proxy) spend output budget on internal reasoning BEFORE emitting the
+    // final JSON. At 200 tokens the reasoning consumes the whole budget and the
+    // answer `content` comes back empty/truncated, so the JSON parse below fails
+    // and every transcript defaults to "not worth processing". 2048 leaves room
+    // to think AND answer; the verdict is small + cached, so the extra budget is
+    // cheap. Non-reasoning models stop early at the closing brace regardless.
     model: verdictModel,
-    max_tokens: 200,
+    max_tokens: 2048,
     system: sys,
     messages: [{ role: 'user', content: `Transcript ${t.basename}:\n\n${trimmed}` }],
   });
