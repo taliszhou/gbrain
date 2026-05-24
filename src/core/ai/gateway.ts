@@ -21,7 +21,7 @@
  *     rotation (via configureGateway()) invalidates stale entries.
  */
 
-import { embed as aiEmbed, embedMany, generateObject, generateText } from 'ai';
+import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema } from 'ai';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { listRecipes } from './recipes/index.ts';
 import { createOpenAI } from '@ai-sdk/openai';
@@ -2179,6 +2179,64 @@ function mapStopReason(
  * Crash-resumable replay is the caller's responsibility (subagent.ts persists
  * blocks via the provider-neutral schema landing in commit 2a).
  */
+/**
+ * Convert gbrain's provider-neutral `ChatMessage[]` into the AI SDK v6
+ * `ModelMessage[]` shape `generateText` validates against. The original code
+ * passed `opts.messages as any`, which happened to work for plain text but
+ * broke any multi-turn tool loop: AI SDK v6 requires tool results to live in a
+ * dedicated `role: 'tool'` message and each tool-result part's `output` to be
+ * tagged (`{type:'text'|'json'|'error-text'|'error-json', value}`), not a bare
+ * value. This translator handles all three block kinds and re-homes any
+ * tool-result blocks (regardless of the source message role) into `tool`
+ * messages so non-Anthropic providers (OpenAI-compatible, Qwen, etc.) accept
+ * the conversation. Pure function — no I/O.
+ */
+function toToolOutput(output: unknown, isError?: boolean): { type: string; value: unknown } {
+  const isStr = typeof output === 'string';
+  if (isError) return isStr ? { type: 'error-text', value: output } : { type: 'error-json', value: output };
+  return isStr ? { type: 'text', value: output } : { type: 'json', value: output };
+}
+
+function toModelMessages(messages: ChatMessage[]): unknown[] {
+  const out: unknown[] = [];
+  for (const m of messages) {
+    // String content: pass straight through (user / assistant / system).
+    if (typeof m.content === 'string') {
+      out.push({ role: m.role, content: m.content });
+      continue;
+    }
+
+    const toolResults: unknown[] = [];
+    const parts: unknown[] = [];
+    for (const b of m.content) {
+      if (b.type === 'text') {
+        if (b.text.length > 0) parts.push({ type: 'text', text: b.text });
+      } else if (b.type === 'tool-call') {
+        parts.push({ type: 'tool-call', toolCallId: b.toolCallId, toolName: b.toolName, input: b.input });
+      } else if (b.type === 'tool-result') {
+        // Always re-home tool results into a `tool` message (AI SDK v6 rule),
+        // regardless of the role the loop stored them under.
+        toolResults.push({
+          type: 'tool-result',
+          toolCallId: b.toolCallId,
+          toolName: b.toolName,
+          output: toToolOutput(b.output, b.isError),
+        });
+      }
+    }
+
+    // Non-tool-result parts keep the message's own role. An assistant turn with
+    // only a tool-call (empty text filtered out) still has its tool-call part.
+    if (parts.length > 0) {
+      out.push({ role: m.role === 'tool' ? 'assistant' : m.role, content: parts });
+    }
+    if (toolResults.length > 0) {
+      out.push({ role: 'tool', content: toolResults });
+    }
+  }
+  return out;
+}
+
 export async function chat(opts: ChatOpts): Promise<ChatResult> {
   const tracker = __budgetStore.getStore() ?? null;
   const modelStrEarly = opts.model ?? getChatModel();
@@ -2255,7 +2313,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   const tools = (opts.tools ?? []).reduce((acc, t) => {
     acc[t.name] = {
       description: t.description,
-      inputSchema: { jsonSchema: t.inputSchema } as any,
+      inputSchema: jsonSchema(t.inputSchema as any),
     };
     return acc;
   }, {} as Record<string, any>);
@@ -2285,7 +2343,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     const result = await generateText({
       model,
       system: opts.system,
-      messages: opts.messages as any,
+      messages: toModelMessages(opts.messages) as any,
       tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
       maxOutputTokens: opts.maxTokens ?? 4096,
       abortSignal: opts.abortSignal,
@@ -2646,10 +2704,12 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
 
     if (stopReason === 'aborted') break;
 
-    // Feed all tool results back as a single user message.
+    // Feed all tool results back as a `tool` message (AI SDK v6 rule; the
+    // translator in chat() re-homes them anyway, but storing the correct role
+    // keeps the persisted thread provider-accurate).
     const userMessageIdx = messageIdx++;
     void userMessageIdx;
-    messages.push({ role: 'user', content: toolResultBlocks });
+    messages.push({ role: 'tool', content: toolResultBlocks });
 
     turnIdx++;
   }
